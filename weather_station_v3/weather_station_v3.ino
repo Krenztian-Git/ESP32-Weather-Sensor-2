@@ -29,6 +29,18 @@
 #include <HardwareSerial.h>
 #include <SPIFFS.h>
 #include <ArduinoJson.h>
+#include <WiFi.h>
+#include <time.h>
+
+// WiFi Configuration
+const char* ssid = "KRISTIAN_2.4GHz";
+const char* password = "Lorenz090416";
+
+//Set Time Zone and NTP Servers//
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 7 * 3600;        
+const int   daylightOffset_sec = 0;          // No DST
+
 
 // ============== RS485 Configuration ==============
 #define MAX485_DE_RE 4
@@ -55,6 +67,30 @@ HardwareSerial RS485Serial(2);
 #define SEND_INTERVAL 15000          // 1 cycle = 15 seconds (deployment: 15 minutes)
 #define CYCLES_PER_DAY 96            // 96 cycles = 1 simulated day
 #define SUNSHINE_THRESHOLD 120.0     // W/m² (WMO standard)
+
+// ============== Sensor Valid Ranges (from specifications) ==============
+// RK330-01 Atmospheric Sensor
+#define TEMP_MIN -40.0       // °C (spec: -40 to 60°C)
+#define TEMP_MAX 60.0        // °C
+#define HUMIDITY_MIN 0.0     // %RH (spec: 0-100%RH)
+#define HUMIDITY_MAX 100.0   // %RH
+#define PRESSURE_MIN 300.0   // hPa (spec: 300-1100 hPa)
+#define PRESSURE_MAX 1100.0  // hPa
+
+// RK120-01 Wind Sensor
+#define WIND_SPEED_MIN 0.0   // m/s (spec: 0-45 m/s for RS485)
+#define WIND_SPEED_MAX 45.0  // m/s
+#define WIND_DIR_MIN 0.0     // degrees (spec: 0-360°)
+#define WIND_DIR_MAX 360.0   // degrees
+
+// RK200-03 Pyranometer (Class C)
+#define SOLAR_MIN 0.0        // W/m² (spec: 0-2000 W/m²)
+#define SOLAR_MAX 2000.0     // W/m²
+
+// RK400-04 Rain Gauge
+#define RAIN_MIN 0.0         // mm
+#define RAIN_MAX 500.0       // mm (reasonable daily max)
+#define RAIN_CYCLE_MAX 50.0  // mm per cycle (reasonable max per 15 min)
 
 // SPIFFS Configuration
 #define SPIFFS_DAILY_FILE "/daily_data.json"
@@ -143,6 +179,20 @@ DailyData daily;
 // ============== SPIFFS Status ==============
 bool spiffsReady = false;
 
+// ============== Data Validation Error Counters ==============
+struct ValidationErrors {
+  int tempOutOfRange;
+  int humidityOutOfRange;
+  int pressureOutOfRange;
+  int windSpeedOutOfRange;
+  int windDirOutOfRange;
+  int solarOutOfRange;
+  int rainOutOfRange;
+  int totalInvalidReadings;
+};
+
+ValidationErrors validationErrors = {0, 0, 0, 0, 0, 0, 0, 0};
+
 // ============== Forward Declarations ==============
 void initializeDailyData();
 void saveDailyToSPIFFS();
@@ -150,6 +200,131 @@ void saveCycleBackup();
 bool loadDailyFromSPIFFS();
 bool loadCycleBackup();
 void printDailySummary();
+
+// ============== Data Validation Functions ==============
+// Returns true if data is valid, false if out of range
+
+bool validateTemperature(float temp) {
+  if (isnan(temp) || temp < TEMP_MIN || temp > TEMP_MAX) {
+    validationErrors.tempOutOfRange++;
+    validationErrors.totalInvalidReadings++;
+    Serial.printf("[INVALID] Temperature %.1f C out of range [%.0f to %.0f]\n",
+                  temp, TEMP_MIN, TEMP_MAX);
+    return false;
+  }
+  return true;
+}
+
+bool validateHumidity(float humidity) {
+  if (isnan(humidity) || humidity < HUMIDITY_MIN || humidity > HUMIDITY_MAX) {
+    validationErrors.humidityOutOfRange++;
+    validationErrors.totalInvalidReadings++;
+    Serial.printf("[INVALID] Humidity %.1f%% out of range [%.0f to %.0f]\n",
+                  humidity, HUMIDITY_MIN, HUMIDITY_MAX);
+    return false;
+  }
+  return true;
+}
+
+bool validatePressure(float pressure) {
+  if (isnan(pressure) || pressure < PRESSURE_MIN || pressure > PRESSURE_MAX) {
+    validationErrors.pressureOutOfRange++;
+    validationErrors.totalInvalidReadings++;
+    Serial.printf("[INVALID] Pressure %.1f hPa out of range [%.0f to %.0f]\n",
+                  pressure, PRESSURE_MIN, PRESSURE_MAX);
+    return false;
+  }
+  return true;
+}
+
+bool validateWindSpeed(float speed) {
+  if (isnan(speed) || speed < WIND_SPEED_MIN || speed > WIND_SPEED_MAX) {
+    validationErrors.windSpeedOutOfRange++;
+    validationErrors.totalInvalidReadings++;
+    Serial.printf("[INVALID] Wind speed %.1f m/s out of range [%.0f to %.0f]\n",
+                  speed, WIND_SPEED_MIN, WIND_SPEED_MAX);
+    return false;
+  }
+  return true;
+}
+
+bool validateWindDirection(float dir) {
+  if (isnan(dir) || dir < WIND_DIR_MIN || dir > WIND_DIR_MAX) {
+    validationErrors.windDirOutOfRange++;
+    validationErrors.totalInvalidReadings++;
+    Serial.printf("[INVALID] Wind direction %.0f deg out of range [%.0f to %.0f]\n",
+                  dir, WIND_DIR_MIN, WIND_DIR_MAX);
+    return false;
+  }
+  return true;
+}
+
+bool validateSolarRadiation(float solar) {
+  if (isnan(solar) || solar < SOLAR_MIN || solar > SOLAR_MAX) {
+    validationErrors.solarOutOfRange++;
+    validationErrors.totalInvalidReadings++;
+    Serial.printf("[INVALID] Solar radiation %.0f W/m2 out of range [%.0f to %.0f]\n",
+                  solar, SOLAR_MIN, SOLAR_MAX);
+    return false;
+  }
+  return true;
+}
+
+bool validateRainfall(float rain) {
+  if (isnan(rain) || rain < RAIN_MIN || rain > RAIN_MAX) {
+    validationErrors.rainOutOfRange++;
+    validationErrors.totalInvalidReadings++;
+    Serial.printf("[INVALID] Rainfall %.1f mm out of range [%.0f to %.0f]\n",
+                  rain, RAIN_MIN, RAIN_MAX);
+    return false;
+  }
+  return true;
+}
+
+bool validateRainfallCycle(float rain) {
+  if (isnan(rain) || rain < 0 || rain > RAIN_CYCLE_MAX) {
+    validationErrors.rainOutOfRange++;
+    validationErrors.totalInvalidReadings++;
+    Serial.printf("[INVALID] Rainfall cycle %.1f mm exceeds max [%.0f]\n",
+                  rain, RAIN_CYCLE_MAX);
+    return false;
+  }
+  return true;
+}
+
+void resetValidationErrors() {
+  validationErrors.tempOutOfRange = 0;
+  validationErrors.humidityOutOfRange = 0;
+  validationErrors.pressureOutOfRange = 0;
+  validationErrors.windSpeedOutOfRange = 0;
+  validationErrors.windDirOutOfRange = 0;
+  validationErrors.solarOutOfRange = 0;
+  validationErrors.rainOutOfRange = 0;
+  validationErrors.totalInvalidReadings = 0;
+}
+
+void printValidationSummary() {
+  if (validationErrors.totalInvalidReadings > 0) {
+    Serial.println("\n[VALIDATION] Invalid readings this day:");
+    if (validationErrors.tempOutOfRange > 0)
+      Serial.printf("  Temperature: %d\n", validationErrors.tempOutOfRange);
+    if (validationErrors.humidityOutOfRange > 0)
+      Serial.printf("  Humidity: %d\n", validationErrors.humidityOutOfRange);
+    if (validationErrors.pressureOutOfRange > 0)
+      Serial.printf("  Pressure: %d\n", validationErrors.pressureOutOfRange);
+    if (validationErrors.windSpeedOutOfRange > 0)
+      Serial.printf("  Wind Speed: %d\n", validationErrors.windSpeedOutOfRange);
+    if (validationErrors.windDirOutOfRange > 0)
+      Serial.printf("  Wind Direction: %d\n", validationErrors.windDirOutOfRange);
+    if (validationErrors.solarOutOfRange > 0)
+      Serial.printf("  Solar Radiation: %d\n", validationErrors.solarOutOfRange);
+    if (validationErrors.rainOutOfRange > 0)
+      Serial.printf("  Rainfall: %d\n", validationErrors.rainOutOfRange);
+    Serial.printf("  TOTAL INVALID: %d\n", validationErrors.totalInvalidReadings);
+  } else {
+    Serial.println("[VALIDATION] All readings within valid ranges");
+  }
+}
 
 // ============== CRC Calculation ==============
 uint16_t calculateCRC(uint8_t *data, uint8_t length) {
@@ -217,10 +392,21 @@ bool readWind() {
 
   if (idx < 9) return false;
 
-  windSpeed = ((resp[3] << 8) | resp[4]) / 10.0;
-  windDir = (resp[5] << 8) | resp[6];
+  float rawSpeed = ((resp[3] << 8) | resp[4]) / 10.0;
+  float rawDir = (resp[5] << 8) | resp[6];
 
-  return true;
+  // Validate readings
+  bool speedValid = validateWindSpeed(rawSpeed);
+  bool dirValid = validateWindDirection(rawDir);
+
+  if (speedValid && dirValid) {
+    windSpeed = rawSpeed;
+    windDir = rawDir;
+    return true;
+  } else {
+    // Keep previous values if invalid
+    return false;
+  }
 }
 
 bool readRain() {
@@ -239,7 +425,14 @@ bool readRain() {
   if (idx < 7) return false;
 
   uint16_t rainRaw = (resp[3] << 8) | resp[4];
-  rainfallTotal = rainRaw * 0.2;
+  float rawTotal = rainRaw * 0.2;
+
+  // Validate total rainfall
+  if (!validateRainfall(rawTotal)) {
+    return false;
+  }
+
+  rainfallTotal = rawTotal;
 
   if (rainfallPrevious < 0) {
     rainfallPrevious = rainfallTotal;
@@ -247,7 +440,12 @@ bool readRain() {
   } else {
     rainfallCycle = rainfallTotal - rainfallPrevious;
     if (rainfallCycle < 0) {
-      rainfallCycle = rainfallTotal;
+      rainfallCycle = rainfallTotal;  // Sensor was reset
+    }
+    // Validate cycle rainfall (unusually high per cycle)
+    if (!validateRainfallCycle(rainfallCycle)) {
+      Serial.println("[WARN] Unusually high rainfall this cycle - keeping value but flagged");
+      // Still accept the value but it's been logged
     }
   }
 
@@ -273,8 +471,14 @@ bool readSolar() {
 
   if (idx < 7) return false;
 
-  solarRadiation = (resp[3] << 8) | resp[4];
+  float rawSolar = (resp[3] << 8) | resp[4];
 
+  // Validate solar radiation
+  if (!validateSolarRadiation(rawSolar)) {
+    return false;
+  }
+
+  solarRadiation = rawSolar;
   return true;
 }
 
@@ -294,17 +498,29 @@ bool readAtmos() {
   if (idx < 11) return false;
 
   uint16_t tempRaw = (resp[3] << 8) | resp[4];
+  float rawTemp;
 
   if (tempRaw >= 0x8000) {
-    currentTemp = (int16_t)(tempRaw - 0xFFFF - 1) / 10.0;
+    rawTemp = (int16_t)(tempRaw - 0xFFFF - 1) / 10.0;
   } else {
-    currentTemp = tempRaw / 10.0;
+    rawTemp = tempRaw / 10.0;
   }
 
-  currentHumidity = ((resp[5] << 8) | resp[6]) / 10.0;
-  currentPressure = ((resp[7] << 8) | resp[8]) / 10.0;
+  float rawHumidity = ((resp[5] << 8) | resp[6]) / 10.0;
+  float rawPressure = ((resp[7] << 8) | resp[8]) / 10.0;
 
-  return true;
+  // Validate all readings
+  bool tempValid = validateTemperature(rawTemp);
+  bool humidityValid = validateHumidity(rawHumidity);
+  bool pressureValid = validatePressure(rawPressure);
+
+  // Update only valid readings
+  if (tempValid) currentTemp = rawTemp;
+  if (humidityValid) currentHumidity = rawHumidity;
+  if (pressureValid) currentPressure = rawPressure;
+
+  // Return true only if all readings are valid
+  return (tempValid && humidityValid && pressureValid);
 }
 
 // ============== Sunshine Duration Tracking ==============
@@ -386,6 +602,9 @@ void initializeDailyData() {
   sunshineDurationMs = 0;
   cycleStartSunshine = 0;
   lastSunshineCheck = millis();
+
+  // Reset validation error counters
+  resetValidationErrors();
 }
 
 void updateDailyAccumulators(float cycleTempMin, float cycleTempMax, float cycleTempAvg,
@@ -788,6 +1007,28 @@ void printDailySummary() {
   Serial.printf("│  Data Completeness:   %.1f%%                                 \n",
                 (daily.cyclesCompleted * 100.0) / CYCLES_PER_DAY);
   Serial.printf("│  Actual Duration:     %lu sec                                \n", dayDuration);
+  Serial.println("├──────────────────────────────────────────────────────────────┤");
+  Serial.println("│  DATA VALIDATION                                             │");
+  Serial.println("├──────────────────────────────────────────────────────────────┤");
+  Serial.printf("│  Invalid Readings:    %d total                               \n", validationErrors.totalInvalidReadings);
+  if (validationErrors.totalInvalidReadings > 0) {
+    if (validationErrors.tempOutOfRange > 0)
+      Serial.printf("│    - Temperature:     %d out of range                       \n", validationErrors.tempOutOfRange);
+    if (validationErrors.humidityOutOfRange > 0)
+      Serial.printf("│    - Humidity:        %d out of range                       \n", validationErrors.humidityOutOfRange);
+    if (validationErrors.pressureOutOfRange > 0)
+      Serial.printf("│    - Pressure:        %d out of range                       \n", validationErrors.pressureOutOfRange);
+    if (validationErrors.windSpeedOutOfRange > 0)
+      Serial.printf("│    - Wind Speed:      %d out of range                       \n", validationErrors.windSpeedOutOfRange);
+    if (validationErrors.windDirOutOfRange > 0)
+      Serial.printf("│    - Wind Direction:  %d out of range                       \n", validationErrors.windDirOutOfRange);
+    if (validationErrors.solarOutOfRange > 0)
+      Serial.printf("│    - Solar Radiation: %d out of range                       \n", validationErrors.solarOutOfRange);
+    if (validationErrors.rainOutOfRange > 0)
+      Serial.printf("│    - Rainfall:        %d out of range                       \n", validationErrors.rainOutOfRange);
+  } else {
+    Serial.println("│    All readings within valid ranges                          │");
+  }
   Serial.println("└──────────────────────────────────────────────────────────────┘");
 
   // CSV summary for easy export
@@ -813,6 +1054,26 @@ void printDailySummary() {
 
 // ============== Setup ==============
 void setup() {
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  Serial.println("NTP time synchronized");
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("Failed to obtain time");
+  } else {
+    Serial.printf("Current time: %02d:%02d:%02d\n", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+  }
+
   Serial.begin(115200);
   delay(1000);
 
@@ -841,6 +1102,15 @@ void setup() {
   Serial.println("  NOTE: For deployment, change SEND_INTERVAL to 900000 (15 min)");
   Serial.println("        96 cycles x 15 min = 1440 min = 24 hours");
   Serial.println();
+  Serial.println("Data Validation Ranges (from sensor specs):");
+  Serial.printf("  Temperature:    %.0f to %.0f C (RK330-01)\n", TEMP_MIN, TEMP_MAX);
+  Serial.printf("  Humidity:       %.0f to %.0f %%RH (RK330-01)\n", HUMIDITY_MIN, HUMIDITY_MAX);
+  Serial.printf("  Pressure:       %.0f to %.0f hPa (RK330-01)\n", PRESSURE_MIN, PRESSURE_MAX);
+  Serial.printf("  Wind Speed:     %.0f to %.0f m/s (RK120-01)\n", WIND_SPEED_MIN, WIND_SPEED_MAX);
+  Serial.printf("  Wind Direction: %.0f to %.0f deg (RK120-01)\n", WIND_DIR_MIN, WIND_DIR_MAX);
+  Serial.printf("  Solar:          %.0f to %.0f W/m2 (RK200-03 Class C)\n", SOLAR_MIN, SOLAR_MAX);
+  Serial.printf("  Rainfall:       %.0f to %.0f mm (RK400-04)\n", RAIN_MIN, RAIN_MAX);
+  Serial.println();
   Serial.println("Commands:");
   Serial.println("  c - Clear rainfall sensor (Rika protocol 6.3)");
   Serial.println("  b - Reset rainfall baseline");
@@ -848,6 +1118,7 @@ void setup() {
   Serial.println("  r - Reset temperature min/max");
   Serial.println("  t - Test all sensors");
   Serial.println("  d - Show current daily accumulators");
+  Serial.println("  v - Show validation error summary");
   Serial.println("  f - Force daily summary now");
   Serial.println("  x - Clear SPIFFS and start fresh");
   Serial.println();
@@ -893,6 +1164,7 @@ void loop() {
       case 'r': case 'R': resetTempTracking(); Serial.println("[TEMP] Reset"); break;
       case 't': case 'T': testAllSensors(); break;
       case 'd': case 'D': showDailyProgress(); break;
+      case 'v': case 'V': printValidationSummary(); break;
       case 'f': case 'F':
         Serial.println("[FORCE] Generating daily summary...");
         printDailySummary();
@@ -935,6 +1207,30 @@ void loop() {
                     isSunshining ? "YES" : "NO",
                     getSunshineDurationMinutes());
     }
+  static bool summaryDoneToday = false;
+static int lastDayChecked = -1;
+
+struct tm timeinfo;
+if (getLocalTime(&timeinfo)) {
+  int currentHour = timeinfo.tm_hour;
+  int currentDay  = timeinfo.tm_mday;
+
+  if (currentHour == 6 && !summaryDoneToday) {
+    Serial.println("[NTP] It's 6:00 AM! Triggering daily summary...");
+    printDailySummary();
+    initializeDailyData();
+    clearSPIFFSDaily();
+    dayNumber++;
+    summaryDoneToday = true;
+    lastDayChecked = currentDay;
+  }
+
+  // Reset flag after 6 AM
+  if (currentHour != 6 && currentDay != lastDayChecked) {
+    summaryDoneToday = false;
+  }
+}
+
   }
 
   // ===== Send All Data Every 15 Seconds (1 Cycle) =====
@@ -1002,19 +1298,13 @@ void loop() {
     }
 
     if (rainOk) {
-      Serial.printf("│  Rain(cycle):  %.1f mm | Rain(total): %.1f mm\n", rainfallCycle, rainfallTotal);
+      Serial.printf("│  Rain(cycle):  %.1f mm | Rain(total): %.1f mm\n", rainfallCycle, daily.dayRainfallTotal); ///Serial.printf("│  Rain(cycle):  %.1f mm | Rain(total): %.1f mm\n", rainfallCycle, rainfallTotal);
     } else {
       Serial.println("│  Rain:         SENSOR ERROR");
     }
 
     if (vpd > 0) {
-      String vpdStatus;
-      if (vpd < 0.4) vpdStatus = "Low (mold risk)";
-      else if (vpd < 0.8) vpdStatus = "Propagation";
-      else if (vpd < 1.2) vpdStatus = "Vegetative";
-      else if (vpd < 1.6) vpdStatus = "Flowering";
-      else vpdStatus = "HIGH (stress)";
-      Serial.printf("│  VPD:          %.3f kPa - %s\n", vpd, vpdStatus.c_str());
+      Serial.printf("│  VPD:          %.3f kPa %s\n", vpd);
     }
 
     Serial.println("└──────────────────────────────────────────────────────────┘");
@@ -1053,18 +1343,18 @@ void loop() {
                   (daily.cyclesCompleted * 100.0) / CYCLES_PER_DAY);
 
     // ===== Check if day is complete (96 cycles) =====
-    if (daily.cyclesCompleted >= CYCLES_PER_DAY) {
-      printDailySummary();
+    //if (daily.cyclesCompleted >= CYCLES_PER_DAY) {
+      //printDailySummary();
 
       // Start new day
-      dayNumber++;
-      initializeDailyData();
-      clearSPIFFSDaily();
+      //dayNumber++;
+      //initializeDailyData();
+      //clearSPIFFSDaily();
 
-      Serial.println("════════════════════════════════════════════════════════════════");
-      Serial.printf("Starting NEW DAY %d | Cycle 0/%d\n", dayNumber, CYCLES_PER_DAY);
-      Serial.println("════════════════════════════════════════════════════════════════\n");
-    }
+      //Serial.println("════════════════════════════════════════════════════════════════");
+      //Serial.printf("Starting NEW DAY %d | Cycle 0/%d\n", dayNumber, CYCLES_PER_DAY);
+      //Serial.println("════════════════════════════════════════════════════════════════\n");
+    //}
   }
 
   delay(100);
