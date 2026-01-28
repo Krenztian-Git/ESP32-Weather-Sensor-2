@@ -10,7 +10,7 @@
  * - Solar (RK200-03):       0x03
  * - Atmospheric (RK330-01): 0x05
  *
- * Timing (Testing Mode - seconds):
+ * Timing (Testing Mode - seconds trial):
  * - Temperature: Read every 5 sec, send Min/Max every 15 sec
  * - All other sensors: Read & send every 15 sec (1 cycle)
  * - 96 cycles = 1 simulated day (24 min in testing, 24 hrs in deployment)
